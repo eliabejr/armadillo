@@ -4,7 +4,7 @@
       Prints the unit's network settings, one per line, with warnings on stderr:
         resolv_conf=<file to bind over /etc/resolv.conf, or empty>
         allow=<DNS resolvers on private networks that IPAddressAllow must open>
-        deny=<IPAddressDeny: loopback, private ranges and this machine's own addresses>
+        deny=<IPAddressDeny: loopback, private ranges and this machine's own prefixes>
 
   netcheck.py probe CGROUP_DIR      (as root)
       Proves that the kernel filter of the service in CGROUP_DIR drops connections
@@ -24,6 +24,7 @@ import sys
 import time
 
 Address = ipaddress.IPv4Address | ipaddress.IPv6Address
+Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 RESOLV_CONF = "/etc/resolv.conf"
 # systemd-resolved's list of upstream servers, for hosts whose resolv.conf only
@@ -37,6 +38,10 @@ DENY_NETWORKS = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "1
 _KEYWORD_NETWORKS = ("127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/64", "224.0.0.0/4", "ff00::/8")
 _DENIED = tuple(ipaddress.ip_network(n) for n in DENY_NETWORKS + _KEYWORD_NETWORKS)
 PROBE_TIMEOUT_S = 2.0
+# An IPv6 address says little about its neighbours (a VM may get a single /128), so
+# the whole /64 around it is denied: its subnet and the temporary addresses SLAAC
+# rotates through.
+IPV6_PREFIX = 64
 
 
 def _unwrap(ip: Address) -> Address:
@@ -65,29 +70,64 @@ def nameservers(text: str) -> list[Address]:
     return found
 
 
+def _fib_local(fib_trie: str):
+    """(address, prefix length) of each range /proc/net/fib_trie routes to this machine."""
+    last = ""
+    for line in fib_trie.splitlines():
+        fields = line.split()
+        if fields[:1] == ["|--"] and len(fields) == 2:  # a leaf: one address, followed by its routes
+            last = fields[1]
+        elif len(fields) == 3 and fields[0][:1] == "/" and fields[1:] == ["host", "LOCAL"]:
+            yield last, fields[0][1:]
+
+
+def _inet6(if_inet6: str):
+    """(address, prefix length) of each line of /proc/net/if_inet6."""
+    for line in if_inet6.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and len(fields[0]) == 32:
+            try:
+                ip = ipaddress.IPv6Address(":".join(fields[0][i : i + 4] for i in range(0, 32, 4)))
+                yield ip, int(fields[2], 16)
+            except ValueError:
+                continue
+
+
 def own_addresses(fib_trie: str, if_inet6: str) -> list[Address]:
     """This machine's addresses, from /proc/net/fib_trie and /proc/net/if_inet6."""
     found: list[Address] = []
-
-    def add(text: str) -> None:
+    for text, plen in _fib_local(fib_trie):
         try:
             ip = ipaddress.ip_address(text)
         except ValueError:
-            return
+            continue
+        if plen == "32" and ip not in found:
+            found.append(ip)
+    for ip, _ in _inet6(if_inet6):
         if ip not in found:
             found.append(ip)
+    return found
 
-    last = ""
-    for line in fib_trie.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("|--"):  # a leaf: one address, followed by its routes
-            last = stripped[3:].strip().split("/")[0]
-        elif stripped == "/32 host LOCAL":
-            add(last)
-    for line in if_inet6.splitlines():
-        fields = line.split()
-        if fields and len(fields[0]) == 32:
-            add(":".join(fields[0][i : i + 4] for i in range(0, 32, 4)))
+
+def own_prefixes(fib_trie: str, if_inet6: str) -> list[Network]:
+    """What to deny around this machine's addresses: each IPv4 range routed to the
+    machine itself (its addresses, and AnyIP ranges such as 127.0.0.0/8), and the
+    /64 around each IPv6 address (or its on-link prefix, if that is shorter)."""
+    found: list[Network] = []
+
+    def add(net: Network) -> None:
+        if net not in found:
+            found.append(net)
+
+    for text, plen in _fib_local(fib_trie):
+        try:
+            add(ipaddress.IPv4Network(f"{text}/{plen}", strict=False))
+        except ValueError:
+            continue
+    for ip, plen in _inet6(if_inet6):
+        if not (ip.is_loopback or ip.is_link_local):
+            plen = min(plen, IPV6_PREFIX)
+        add(ipaddress.IPv6Network((ip, plen), strict=False))
     return found
 
 
@@ -95,16 +135,25 @@ def local_addresses() -> list[Address]:
     return own_addresses(_read("/proc/net/fib_trie"), _read("/proc/net/if_inet6"))
 
 
+def _covered(net: Network, nets: list[Network]) -> bool:
+    return any(net.version == n.version and net.subnet_of(n) for n in nets)
+
+
+def _fmt(net: Network) -> str:
+    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+
+
 def _denied(ip: Address) -> bool:
     return any(ip.version == net.version and ip in net for net in _DENIED)
 
 
 def filter_config(
-    resolv_conf: str, uplink: str | None, own: list[Address]
+    resolv_conf: str, uplink: str | None, own: list[Network]
 ) -> tuple[str, list[str], list[str], list[str]]:
     """Return (file to bind over /etc/resolv.conf or "", allow, deny, warnings).
 
     `uplink` is the text of systemd-resolved's upstream list, or None if it has none.
+    `own` is this machine's prefixes (own_prefixes).
     """
     bind = ""
     servers = nameservers(resolv_conf)
@@ -120,8 +169,8 @@ def filter_config(
             reason = "link-local, where cloud metadata servers live"
         elif ip.is_unspecified or ip.is_multicast:
             reason = "not a unicast address"
-        elif ip in own:
-            reason = "one of this machine's own addresses"
+        elif any(ip.version == net.version and ip in net for net in own):
+            reason = "one of this machine's own addresses, or next to one"
         else:
             usable += 1
             if _denied(ip):
@@ -130,7 +179,7 @@ def filter_config(
         warnings.append(f"not allowing DNS resolver {ip}: it is {reason}, and allowing it opens all of its ports")
     if not usable:
         warnings.append("the service has no DNS resolver it may use; list a public or private-network one in /etc/resolv.conf")
-    extra = [str(ip) for ip in own if not _denied(ip)]
+    extra = [_fmt(net) for net in own if not _covered(net, list(_DENIED))]
     deny = [*DENY_KEYWORDS, *DENY_NETWORKS, *extra]
     return bind, allow, deny, warnings
 
@@ -203,7 +252,11 @@ def probe(cgroup_dir: str, timeout: float = PROBE_TIMEOUT_S) -> int:
 def main(argv: list[str]) -> int:
     if argv[:1] == ["filter-config"] and len(argv) == 1:
         uplink = _read(RESOLVED_UPLINK) if os.path.exists(RESOLVED_UPLINK) else None
-        bind, allow, deny, warnings = filter_config(_read(RESOLV_CONF), uplink, local_addresses())
+        fib_trie = _read("/proc/net/fib_trie")
+        own = own_prefixes(fib_trie, _read("/proc/net/if_inet6"))
+        bind, allow, deny, warnings = filter_config(_read(RESOLV_CONF), uplink, own)
+        if not fib_trie:
+            warnings.append("cannot read /proc/net/fib_trie: this machine's IPv4 addresses are not denied")
         for warning in warnings:
             print(f"warning: {warning}", file=sys.stderr)
         print(f"resolv_conf={bind}\nallow={' '.join(allow)}\ndeny={' '.join(deny)}")

@@ -185,8 +185,9 @@ proteções são em camadas:
   - A unit `scrape-api.socket` é dona da porta e a passa ao serviço por socket
     activation.
   - O serviço tem `IPAddressDeny` para loopback, redes privadas, link-local,
-    metadados e os próprios endereços da máquina (inclusive os públicos, como o
-    IPv6 da VPS).
+    metadados e os prefixos da própria máquina, inclusive os públicos: os
+    endereços IPv4 dela e o /64 de cada endereço IPv6 (ou o prefixo da rede
+    local, se for maior).
   - Toda conexão que o serviço ou o Chromium abrem para esses destinos é
     descartada pelo kernel (ela expira), venha de redirect, iframe, popup,
     worker, websocket ou DNS rebinding. As conexões que chegam pela porta
@@ -227,6 +228,9 @@ proteções são em camadas:
 - **Lista fixada na instalação.** Os resolvedores e os endereços da máquina são
   lidos quando o instalador roda. Se mudarem (outro IP, outro DNS), rode o
   instalador de novo.
+- **Vizinhos na mesma rede IPv6.** Sites hospedados no mesmo /64 que a máquina
+  (ou na mesma rede local, se o prefixo dela for maior) ficam fora do alcance do
+  serviço.
 - **Profundidade diferente do Firecrawl.** As páginas do sitemap entram como
   profundidade 1. O `maxDepth` da v1 conta saltos de link, não segmentos do
   caminho. URLs bloqueadas pelo robots.txt também consomem o `limit`.

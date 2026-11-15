@@ -115,9 +115,10 @@ OLD_PORT_HOLDER=""
 sudo test -f "$SOCKET_FILE" || OLD_PORT_HOLDER=1  # an older unit listened on the port itself
 
 # The service may not reach loopback, private networks or this machine's own
-# addresses. DNS resolvers on a private network (a VPC resolver, a home router)
-# are allowed, because allowing an address opens all of its ports; resolvers on
-# loopback or link-local never are. On systemd-resolved hosts the service reads
+# prefixes (its addresses, the /64 around each IPv6 one). DNS resolvers on a
+# private network (a VPC resolver, a home router) are allowed, because allowing an
+# address opens all of its ports; resolvers on loopback, link-local or this
+# machine's prefixes never are. On systemd-resolved hosts the service reads
 # resolved's upstream servers instead of its 127.0.0.53 stub.
 NET="$("$PY" -I "$APP_DIR/deploy/netcheck.py" filter-config)" || die "could not work out the network filter"
 net_get() { sed -n "s/^$1=//p" <<<"$NET"; }

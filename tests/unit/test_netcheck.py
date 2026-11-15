@@ -15,6 +15,7 @@ netcheck = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(netcheck)
 
 ip = ipaddress.ip_address
+net = ipaddress.ip_network
 STUB = "# managed by systemd-resolved\nnameserver 127.0.0.53\noptions edns0 trust-ad\nsearch .\n"
 FIB_TRIE = """Main:
   +-- 0.0.0.0/0 3 0 5
@@ -71,10 +72,11 @@ def test_public_resolvers_need_nothing():
         ("fe80::1%eth0", "link-local"),
         ("0.0.0.0", "unicast"),
         ("192.168.1.10", "own addresses"),
+        ("2001:db8::53", "next to one"),
     ],
 )
 def test_resolvers_that_would_open_this_machine_are_not_allowed(server, reason):
-    own = [ip("192.168.1.10")]
+    own = [net("192.168.1.10/32"), net("2001:db8::/64")]
     _, allow, _, warnings = netcheck.filter_config(f"nameserver {server}\n", None, own)
     assert allow == []
     assert reason in warnings[0]
@@ -90,20 +92,23 @@ def test_stub_without_upstream_servers_warns_instead_of_allowing_it():
 
 
 @pytest.mark.case("NET-05")
-def test_own_public_addresses_join_the_deny_list():
-    own = netcheck.own_addresses(FIB_TRIE, IF_INET6)
-    assert own == [ip("127.0.0.1"), ip("172.16.0.2"), ip("203.0.113.5"),
-                   ip("::1"), ip("fe80::a8bb:ccff:fe00:1122"), ip("2001:db8::5")]
+def test_own_public_prefixes_join_the_deny_list():
+    assert netcheck.own_addresses(FIB_TRIE, IF_INET6) == [
+        ip("127.0.0.1"), ip("172.16.0.2"), ip("203.0.113.5"),
+        ip("::1"), ip("fe80::a8bb:ccff:fe00:1122"), ip("2001:db8::5")]
+    own = netcheck.own_prefixes(FIB_TRIE, IF_INET6)
+    assert own == [net("127.0.0.0/8"), net("127.0.0.1/32"), net("172.16.0.2/32"), net("203.0.113.5/32"),
+                   net("::1/128"), net("fe80::/64"), net("2001:db8::/64")]
     _, _, deny, _ = netcheck.filter_config("nameserver 1.1.1.1\n", None, own)
     assert deny[: len(netcheck.DENY_KEYWORDS) + len(netcheck.DENY_NETWORKS)] == [
         *netcheck.DENY_KEYWORDS, *netcheck.DENY_NETWORKS]
     # Already covered by a range: loopback, 172.16/12, link-local. 2001:db8:: is not.
-    assert deny[len(netcheck.DENY_KEYWORDS) + len(netcheck.DENY_NETWORKS):] == ["203.0.113.5", "2001:db8::5"]
+    assert deny[len(netcheck.DENY_KEYWORDS) + len(netcheck.DENY_NETWORKS):] == ["203.0.113.5", "2001:db8::/64"]
 
 
 @pytest.mark.case("NET-06")
 def test_own_address_as_resolver_is_not_usable_even_if_public():
-    _, allow, deny, warnings = netcheck.filter_config("nameserver 203.0.113.5\n", None, [ip("203.0.113.5")])
+    _, allow, deny, warnings = netcheck.filter_config("nameserver 203.0.113.5\n", None, [net("203.0.113.5/32")])
     assert allow == [] and "203.0.113.5" in deny
     assert "own addresses" in warnings[0]
 
@@ -166,3 +171,17 @@ def test_probe_cannot_join_or_has_no_control(no_local_addresses, tmp_path, monke
     assert netcheck.probe(str(tmp_path / "missing")) == 2
     monkeypatch.setattr(netcheck, "_connect_all", lambda targets, port, timeout: {t: "dropped" for t in targets})
     assert netcheck.probe(str(tmp_path)) == 3
+
+
+@pytest.mark.case("NET-11")
+def test_prefixes_widen_ipv6_to_its_64_and_keep_anyip_ranges():
+    fib_trie = "Local:\n     |-- 198.51.100.0\n        /24 host LOCAL\n     |-- 198.51.100.255\n        /32 link BROADCAST\n"
+    if_inet6 = (
+        "20010db8000a7b1dc0730000000000d6 03 80 00 82     eth0\n"  # a single /128, as on a cloud VM
+        "20010db8000100000000000000000001 02 30 00 80     eth1\n"  # a /48 on-link: kept whole
+        "00000000000000000000000000000001 01 80 10 80       lo\n"
+    )
+    assert netcheck.own_prefixes(fib_trie, if_inet6) == [
+        net("198.51.100.0/24"), net("2001:db8:a:7b1d::/64"), net("2001:db8:1::/48"), net("::1/128")]
+    assert netcheck.own_addresses(fib_trie, if_inet6)[0] == ip("2001:db8:a:7b1d:c073::d6")
+
