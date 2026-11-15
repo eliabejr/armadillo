@@ -116,10 +116,10 @@ Data a 33335, IPRoyal a 12321 e Oxylabs a 7777.
 
 ## Instalar numa máquina nova
 
-Funciona em qualquer Linux com systemd e cgroup v2, rodando como usuário comum
-com sudo. Em Debian e Ubuntu, o instalador instala sozinho as bibliotecas de
-sistema do Chromium; em outras distribuições, instale-as pelo gerenciador de
-pacotes se ele pedir.
+Funciona em qualquer Linux com systemd, cgroup v2 e o `python3` do sistema
+(3.10 ou mais novo), rodando como usuário comum com sudo. Em Debian e Ubuntu, o
+instalador instala sozinho as bibliotecas de sistema do Chromium; em outras
+distribuições, instale-as pelo gerenciador de pacotes se ele pedir.
 
 ```bash
 git clone <este repo> ~/apps/scrape-api   # ou copie a pasta
@@ -131,7 +131,8 @@ O instalador instala:
 - o Chromium do Playwright em `/opt/scrape-api` (e as bibliotecas do sistema, se
   necessário);
 - o arquivo de configuração, com uma chave nova;
-- a unit systemd `scrape-api`.
+- as units systemd `scrape-api` (o serviço) e `scrape-api-addresses` (o vigia
+  dos endereços da máquina, veja [Segurança](#segurança)).
 
 Depois, confere o `/health` e o filtro de rede. Pode rodar de novo à vontade: a
 chave e as configurações são mantidas. Opções: `--port N` e `--public-url URL`.
@@ -167,7 +168,8 @@ SCRAPE_SSH="ssh user@outra-maquina" scripts/deploy.sh   # outra máquina
 ```
 
 A release nova só entra em serviço se o `install.sh` dela passar. Se falhar, ele
-volta para a anterior quando ela passa nas mesmas checagens, ou remove as units.
+volta para a anterior quando ela passa nas mesmas checagens (inclusive a do vigia
+de endereços), ou remove as units.
 O deploy guarda a release atual e a anterior e apaga as mais antigas.
 
 Os testes de integração sobem a API de verdade, com um site de teste e um proxy
@@ -192,6 +194,12 @@ proteções são em camadas:
     descartada pelo kernel (ela expira), venha de redirect, iframe, popup,
     worker, websocket ou DNS rebinding. As conexões que chegam pela porta
     passada não são afetadas.
+  - Os endereços mudam (uma VM pode acordar com outro IPv6, sem reiniciar
+    nada), então a unit `scrape-api-addresses` acompanha os eventos de endereço
+    e de rota do kernel e acrescenta cada prefixo novo ao filtro do serviço em
+    execução, em menos de um segundo. Ela roda como root, a partir de uma cópia do
+    `deploy/netcheck.py` que só o root altera, com o `python3` do sistema. O
+    serviço está preso a ela (`BindsTo`): se ela para, ele para.
 - **Na aplicação.** URLs ambíguas são recusadas: `\`, espaços, credenciais,
   porta ou host inválidos. O navegador recebe a URL canônica que foi conferida.
   Hosts privados são recusados no primeiro salto. Requisições do navegador para
@@ -225,9 +233,10 @@ proteções são em camadas:
   Resolvedores em loopback ou link-local nunca são: o instalador avisa, e o
   serviço fica sem DNS até haver outro. Com systemd-resolved, o serviço lê os
   servidores de `/run/systemd/resolve/resolv.conf` em vez do stub `127.0.0.53`.
-- **Lista fixada na instalação.** Os resolvedores e os endereços da máquina são
-  lidos quando o instalador roda. Se mudarem (outro IP, outro DNS), rode o
-  instalador de novo.
+- **DNS fixado na instalação.** Os resolvedores são lidos quando o instalador
+  roda; se mudarem, rode o instalador de novo. Os endereços da máquina, não: o
+  vigia os acompanha, com uma janela de fração de segundo entre a mudança e o
+  bloqueio.
 - **Vizinhos na mesma rede IPv6.** Sites hospedados no mesmo /64 que a máquina
   (ou na mesma rede local, se o prefixo dela for maior) ficam fora do alcance do
   serviço.

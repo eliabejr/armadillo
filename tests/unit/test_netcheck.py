@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import ipaddress
 import os
 import socket
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -185,3 +190,141 @@ def test_prefixes_widen_ipv6_to_its_64_and_keep_anyip_ranges():
         net("198.51.100.0/24"), net("2001:db8:a:7b1d::/64"), net("2001:db8:1::/48"), net("::1/128")]
     assert netcheck.own_addresses(fib_trie, if_inet6)[0] == ip("2001:db8:a:7b1d:c073::d6")
 
+
+# --- the watcher -----------------------------------------------------------------
+
+BASE_DENY = "127.0.0.0/8 ::1/128 fe80::/64 172.16.0.0/12 2001:db8:a:7b37:1afd::ba/128"
+
+
+@pytest.fixture
+def host(monkeypatch):
+    """A machine whose IPv6 has just changed, and a fake systemctl."""
+    state = {"deny": BASE_DENY, "calls": [], "apply": True}
+    files = {
+        "/proc/net/fib_trie": "Local:\n     |-- 172.16.0.2\n        /32 host LOCAL\n",
+        "/proc/net/if_inet6": "20010db8000a7b1dc0730000000000d6 03 80 00 82     eth0\n",
+    }
+    monkeypatch.setattr(netcheck, "_read", lambda path: files.get(path, ""))
+
+    def systemctl(*args):
+        state["calls"].append(args)
+        if args[0] == "show":
+            return subprocess.CompletedProcess(args, 0, state["deny"] + "\n", "")
+        if state["apply"]:
+            state["deny"] += " " + args[-1].removeprefix("IPAddressDeny=")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(netcheck, "_systemctl", systemctl)
+    state["files"] = files
+    return state
+
+
+@pytest.mark.case("NET-12")
+def test_sync_adds_only_the_missing_prefix_and_proves_it(host):
+    assert netcheck.sync("scrape-api.service") is True
+    sets = [c for c in host["calls"] if c[0] == "set-property"]
+    assert sets == [("set-property", "--runtime", "scrape-api.service", "IPAddressDeny=2001:db8:a:7b1d::/64")]
+    host["calls"].clear()
+    assert netcheck.sync("scrape-api.service") is True  # nothing left to add
+    assert [c[0] for c in host["calls"]] == ["show"]
+
+
+@pytest.mark.case("NET-13")
+def test_sync_fails_closed(host):
+    host["apply"] = False  # systemd took the call, but the list did not change
+    assert netcheck.sync("scrape-api.service") is False
+
+    def set_calls():
+        return [c for c in host["calls"] if c[0] == "set-property"]
+
+    host["calls"].clear()
+    host["deny"] = ""  # an unknown unit: show prints an empty list
+    assert netcheck.sync("scrape-api.service") is False
+    assert set_calls() == []
+    host["deny"], host["files"]["/proc/net/fib_trie"] = BASE_DENY, ""
+    assert netcheck.sync("scrape-api.service") is False
+    assert set_calls() == []
+
+
+@pytest.mark.case("NET-14")
+@pytest.mark.skipif(sys.platform != "linux", reason="abstract unix sockets")
+def test_watch_reports_ready_and_checks_once_per_burst(monkeypatch):
+    calls = []
+    monkeypatch.setattr(netcheck, "sync", lambda unit: calls.append(unit) or True)
+    monkeypatch.setattr(netcheck, "SETTLE_S", 0.05)
+    name = f"armadillo-test-{os.getpid()}"
+    monkeypatch.setenv("NOTIFY_SOCKET", "@" + name)
+    events, kernel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify, kernel:
+        notify.bind("\0" + name)
+        for _ in range(3):  # one burst of address messages
+            kernel.send(b"RTM_NEWADDR")
+        # Then the event source goes away: the watcher must exit, never idle.
+        timer = threading.Timer(0.5, kernel.close)
+        timer.start()
+        assert netcheck.watch("scrape-api.service", events) == 1
+        timer.join()
+        assert notify.recv(64) == b"READY=1"
+    assert calls == ["scrape-api.service"] * 2  # the first check, then one for the burst
+
+
+@pytest.mark.case("NET-15")
+def test_watch_exits_when_a_check_fails(monkeypatch):
+    monkeypatch.setattr(netcheck, "sync", lambda unit: False)
+    monkeypatch.setattr(netcheck, "_notify", lambda state: pytest.fail("reported ready"))
+    events, kernel = socket.socketpair()
+    with kernel:
+        assert netcheck.watch("scrape-api.service", events) == 1
+    # A check that fails after the watcher reported ready ends it too.
+    results, ready = iter([True, False]), []
+    monkeypatch.setattr(netcheck, "sync", lambda unit: next(results))
+    monkeypatch.setattr(netcheck, "_notify", ready.append)
+    events, kernel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with kernel:
+        kernel.send(b"RTM_NEWADDR")
+        assert netcheck.watch("scrape-api.service", events) == 1
+    assert ready == ["READY=1"]
+
+
+@pytest.mark.case("NET-16")
+def test_lost_events_still_count_as_a_change():
+    class Events:
+        def __init__(self, outcome):
+            self.outcome = outcome
+
+        def recv(self, size):
+            if isinstance(self.outcome, OSError):
+                raise self.outcome
+            return self.outcome
+
+    assert netcheck._next_event(Events(OSError(errno.ENOBUFS, "lost"))) is True
+    assert netcheck._next_event(Events(b"RTM_NEWADDR")) is True
+    assert netcheck._next_event(Events(b"")) is False
+    with pytest.raises(OSError):
+        netcheck._next_event(Events(OSError(errno.EBADF, "closed")))
+
+
+@pytest.mark.case("NET-17")
+def test_a_stream_of_events_does_not_delay_the_check(monkeypatch):
+    monkeypatch.setattr(netcheck, "SETTLE_S", 0.1)
+    monkeypatch.setattr(netcheck, "SETTLE_MAX_S", 0.3)
+    monkeypatch.setattr(netcheck, "_notify", lambda state: None)
+    checks = []
+    monkeypatch.setattr(netcheck, "sync", lambda unit: checks.append(time.monotonic()) or len(checks) == 1)
+    events, kernel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    stop = threading.Event()
+
+    def flap():  # an event every 20 ms, shorter than SETTLE_S each time, for up to 3 s
+        end = time.monotonic() + 3
+        while not stop.wait(0.02) and time.monotonic() < end:
+            kernel.send(b"RTM_NEWADDR")
+
+    sender = threading.Thread(target=flap)
+    with kernel:
+        sender.start()
+        try:
+            assert netcheck.watch("scrape-api.service", events) == 1
+        finally:
+            stop.set()
+            sender.join()
+    assert len(checks) == 2 and checks[1] - checks[0] < 1.0

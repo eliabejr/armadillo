@@ -12,6 +12,12 @@ PUBLIC_URL_ARG=""
 ENV_FILE=/etc/scrape-api/env
 UNIT_FILE=/etc/systemd/system/scrape-api.service
 SOCKET_FILE=/etc/systemd/system/scrape-api.socket
+WATCH_FILE=/etc/systemd/system/scrape-api-addresses.service
+# The address watcher runs as root, so its code lives where only root can change it.
+LIB_DIR=/usr/local/lib/scrape-api
+# Where `systemctl set-property --runtime` (the watcher) keeps what it adds.
+RUNTIME_DROPIN=/run/systemd/system.control/scrape-api.service.d
+SYS_PY=/usr/bin/python3
 OPT_DIR=/opt/scrape-api
 UV_VERSION=0.12.23
 
@@ -34,6 +40,10 @@ done
 [[ $EUID -ne 0 ]] || die "run as the normal user (with sudo rights), not as root"
 command -v systemctl >/dev/null || die "systemd is required"
 sudo -n true 2>/dev/null || sudo -v || die "sudo is required"
+[[ -x "$SYS_PY" && "$(stat -L -c %u "$SYS_PY")" == 0 ]] &&
+  "$SYS_PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))' ||
+  die "needs the system's $SYS_PY (3.10 or newer, owned by root), e.g. apt install python3"
+NETCHECK=("$SYS_PY" -I "$LIB_DIR/netcheck.py")
 
 env_get() { sudo sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; }
 env_set() {  # values are checked by the callers: digits or a plain http(s) URL
@@ -106,11 +116,14 @@ PORT="${PORT:-3002}"
 [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || die "SCRAPE_PORT in $ENV_FILE is not a port: $PORT"
 
 step "systemd units"
-# Keep the units now in service, to roll back if the new release does not come up.
+# Keep the units now in service, and the watcher code they run, to roll back if
+# the new release does not come up.
 BACKUP="$(mktemp -d)"
-for f in "$UNIT_FILE" "$SOCKET_FILE"; do
-  if sudo test -f "$f"; then sudo cp "$f" "$BACKUP/"; fi
+mkdir "$BACKUP/units"
+for f in "$UNIT_FILE" "$SOCKET_FILE" "$WATCH_FILE"; do
+  if sudo test -f "$f"; then sudo cp "$f" "$BACKUP/units/"; fi
 done
+if sudo test -f "$LIB_DIR/netcheck.py"; then sudo cp "$LIB_DIR/netcheck.py" "$BACKUP/"; fi
 OLD_PORT_HOLDER=""
 sudo test -f "$SOCKET_FILE" || OLD_PORT_HOLDER=1  # an older unit listened on the port itself
 
@@ -120,7 +133,7 @@ sudo test -f "$SOCKET_FILE" || OLD_PORT_HOLDER=1  # an older unit listened on th
 # address opens all of its ports; resolvers on loopback, link-local or this
 # machine's prefixes never are. On systemd-resolved hosts the service reads
 # resolved's upstream servers instead of its 127.0.0.53 stub.
-NET="$("$PY" -I "$APP_DIR/deploy/netcheck.py" filter-config)" || die "could not work out the network filter"
+NET="$("$SYS_PY" -I "$APP_DIR/deploy/netcheck.py" filter-config)" || die "could not work out the network filter"
 net_get() { sed -n "s/^$1=//p" <<<"$NET"; }
 RESOLV_BIND="$(net_get resolv_conf)"
 ALLOW="$(net_get allow)"
@@ -131,6 +144,8 @@ DENY="$(net_get deny)"
 UNIT_DNS=""
 [[ -z "$RESOLV_BIND" ]] || UNIT_DNS+="BindReadOnlyPaths=$RESOLV_BIND:/etc/resolv.conf"$'\n'
 [[ -z "$ALLOW" ]] || UNIT_DNS+="# DNS only: the private resolvers named in /etc/resolv.conf"$'\n'"IPAddressAllow=$ALLOW"$'\n'
+
+sudo install -D -o root -g root -m 644 "$APP_DIR/deploy/netcheck.py" "$LIB_DIR/netcheck.py"
 
 # The socket unit owns the port and hands it to the service (socket activation).
 # Access lists of a service do not apply to sockets passed in (systemd.resource-
@@ -152,7 +167,9 @@ sudo tee "$UNIT_FILE" >/dev/null <<EOF
 [Unit]
 Description=scrape-api (Firecrawl-compatible scraping API + MCP)
 Requires=scrape-api.socket
-After=scrape-api.socket network-online.target
+# Never runs without the watcher that keeps this machine's new addresses denied.
+BindsTo=scrape-api-addresses.service
+After=scrape-api.socket scrape-api-addresses.service network-online.target
 Wants=network-online.target
 
 [Service]
@@ -189,8 +206,42 @@ TasksMax=2048
 [Install]
 WantedBy=multi-user.target
 EOF
+# The deny list above is fixed at install time, but addresses change: a VM may get
+# a new IPv6 when it resumes, without any restart. The watcher adds each new prefix
+# to the running service's filter, through the kernel netlink address events.
+sudo tee "$WATCH_FILE" >/dev/null <<EOF
+[Unit]
+Description=scrape-api: deny the service this machine's addresses as they change
+Before=scrape-api.service
+
+[Service]
+Type=notify
+ExecStart=$SYS_PY -I $LIB_DIR/netcheck.py watch scrape-api.service
+Restart=on-failure
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+# What the watcher added repeats the whole list, so it would hide the list written
+# above; when it restarts, the watcher adds back whatever is still missing. Stop
+# the units first, so that no watcher writes it again before the reload.
+sudo systemctl stop scrape-api.socket scrape-api-addresses.service scrape-api.service 2>/dev/null || true
+sudo rm -rf "$RUNTIME_DROPIN"
 sudo systemctl daemon-reload
-sudo systemctl enable --quiet scrape-api.socket scrape-api.service
+sudo systemctl enable --quiet scrape-api-addresses.service scrape-api.socket scrape-api.service
 
 healthy() {
   for _ in $(seq 1 90); do
@@ -207,7 +258,7 @@ filter_active() {
   local cg
   cg="$(systemctl show -p ControlGroup --value scrape-api.service)"
   [[ -n "$cg" ]] || return 1
-  sudo "$PY" -I "$APP_DIR/deploy/netcheck.py" probe "/sys/fs/cgroup$cg"
+  sudo "${NETCHECK[@]}" probe "/sys/fs/cgroup$cg"
 }
 # Name resolution as the service sees it: its cgroup and its mount namespace,
 # where its own resolv.conf may be bound.
@@ -220,37 +271,43 @@ resolves_inside() {
     'echo $$ > "$CG/cgroup.procs" && exec nsenter -t "$PID" -m getent hosts example.com' >/dev/null 2>&1
 }
 remove_units() {
-  sudo systemctl disable --quiet scrape-api.service scrape-api.socket 2>/dev/null || true
-  sudo rm -f "$UNIT_FILE" "$SOCKET_FILE"
+  sudo systemctl disable --quiet scrape-api.service scrape-api.socket scrape-api-addresses.service 2>/dev/null || true
+  sudo rm -f "$UNIT_FILE" "$SOCKET_FILE" "$WATCH_FILE"
+  sudo rm -rf "$RUNTIME_DROPIN"
   sudo systemctl daemon-reload
 }
-# Put the previous units back if they still pass both checks. Otherwise, and on a
-# first install, remove the units: a later run must not restore a unit that never
-# proved its filter. errexit still applies in here, so the steps that may fail
-# only feed the checks.
+watcher_active() { systemctl is-active --quiet scrape-api-addresses.service; }
+# Put the previous units back if they still pass every check, the address watcher
+# included. Otherwise, and on a first install, remove the units: a later run must
+# not restore a unit that never proved its filter. errexit still applies in here,
+# so the steps that may fail only feed the checks.
 rollback() {
-  sudo journalctl -u scrape-api -n 40 --no-pager >&2 || true
-  sudo systemctl stop scrape-api.service scrape-api.socket || true
-  if ls "$BACKUP"/* >/dev/null 2>&1; then
+  sudo journalctl -u scrape-api -u scrape-api-addresses -n 40 --no-pager >&2 || true
+  sudo systemctl stop scrape-api.service scrape-api.socket scrape-api-addresses.service || true
+  if ls "$BACKUP/units/"* >/dev/null 2>&1; then
     echo "rolling back to the previous units" >&2
-    sudo rm -f "$SOCKET_FILE"
-    sudo cp "$BACKUP"/* /etc/systemd/system/
+    sudo rm -f "$SOCKET_FILE" "$WATCH_FILE"
+    sudo cp "$BACKUP/units/"* /etc/systemd/system/
+    if sudo test -f "$BACKUP/netcheck.py"; then sudo cp "$BACKUP/netcheck.py" "$LIB_DIR/netcheck.py"; fi
+    sudo rm -rf "$RUNTIME_DROPIN"
     sudo systemctl daemon-reload
+    if sudo test -f "$WATCH_FILE"; then sudo systemctl start scrape-api-addresses.service || true; fi
     if sudo test -f "$SOCKET_FILE"; then sudo systemctl start scrape-api.socket || true; fi
     sudo systemctl start scrape-api.service || true
-    if healthy && filter_active; then die "$1; the previous release is back in service"; fi
+    if healthy && filter_active && watcher_active; then die "$1; the previous release is back in service"; fi
     echo "the previous units fail the checks too; removing them" >&2
-    sudo systemctl stop scrape-api.service scrape-api.socket || true
+    sudo systemctl stop scrape-api.service scrape-api.socket scrape-api-addresses.service || true
   else
     echo "first install: removing the new units" >&2
   fi
   remove_units
   die "$1"
 }
-# Free the port from an older unit, then bind it through the socket unit.
+# Free the port from an older unit, then bind it through the socket unit. The
+# watcher goes first: the service is bound to it and starts after its first check.
 if [[ -n "$OLD_PORT_HOLDER" ]]; then sudo systemctl stop scrape-api.service; fi
-{ sudo systemctl restart scrape-api.socket && sudo systemctl restart scrape-api.service; } ||
-  rollback "the new units did not start"
+{ sudo systemctl restart scrape-api-addresses.service && sudo systemctl restart scrape-api.socket &&
+  sudo systemctl restart scrape-api.service; } || rollback "the new units did not start"
 
 step "Health check"
 healthy || rollback "the new release did not become healthy on port $PORT"
@@ -259,6 +316,7 @@ curl -fsS "http://127.0.0.1:$PORT/health"; echo
 step "Private-network filter"
 filter_active || rollback "the kernel IP filter does not hold for scrape-api (needs cgroup v2 with BPF); refusing to run without it"
 echo "a process in the service's cgroup cannot reach loopback or this machine's addresses: ok"
+watcher_active || rollback "the address watcher is not running"
 resolves_inside || echo "warning: name resolution fails inside the service's cgroup; check /etc/resolv.conf" >&2
 rm -rf "$BACKUP"
 
@@ -270,7 +328,7 @@ scrape-api is running from $APP_DIR
   Local:   http://127.0.0.1:$PORT
   Public:  ${PUBLIC_URL:-(none: it listens on 127.0.0.1 only; put an HTTPS proxy or tunnel in front, then rerun with --public-url)}
   API key: sudo sed -n 's/^SCRAPE_API_KEYS=//p' $ENV_FILE
-  Logs:    journalctl -u scrape-api -f
+  Logs:    journalctl -u scrape-api -u scrape-api-addresses -f
 
 Add it to Claude Code on any machine:
   claude mcp add --scope user --transport http scrape $BASE/mcp --header "Authorization: Bearer <key>"

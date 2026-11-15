@@ -11,6 +11,12 @@
       to loopback (127.0.0.1, 127.0.0.53, ::1) and to this machine's own addresses.
       Exit 0: all dropped; 1: something was reachable; 2: could not join the cgroup;
       3: inconclusive (the control connection from outside the cgroup failed).
+
+  netcheck.py watch UNIT            (as root, from a Type=notify unit)
+      Keeps this machine's prefixes in UNIT's IPAddressDeny while addresses change
+      (a VM that gets a new IPv6 when it resumes, SLAAC, DHCP): checks once, reports
+      ready, then checks again after every address change. Exits 1 if it cannot
+      deny a prefix, so that a unit bound to it stops.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import ipaddress
 import os
 import select
 import socket
+import subprocess
 import sys
 import time
 
@@ -42,6 +49,12 @@ PROBE_TIMEOUT_S = 2.0
 # the whole /64 around it is denied: its subnet and the temporary addresses SLAAC
 # rotates through.
 IPV6_PREFIX = 64
+# Address events, and IPv4 route events for AnyIP ranges (`ip route add local ...`).
+RTMGRP_IPV4_ROUTE = 0x40
+RTMGRP_IPV4_IFADDR = 0x10
+RTMGRP_IPV6_IFADDR = 0x100
+SETTLE_S = 0.2
+SETTLE_MAX_S = 0.5
 
 
 def _unwrap(ip: Address) -> Address:
@@ -249,6 +262,92 @@ def probe(cgroup_dir: str, timeout: float = PROBE_TIMEOUT_S) -> int:
     return 1 if failed else 0
 
 
+def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True)
+
+
+def applied_deny(unit: str) -> list[Network] | None:
+    """The unit's IPAddressDeny as systemd applies it; None if it cannot be read."""
+    shown = _systemctl("show", "-p", "IPAddressDeny", "--value", unit)
+    if shown.returncode:
+        return None
+    try:
+        nets = [ipaddress.ip_network(entry, strict=False) for entry in shown.stdout.split()]
+    except ValueError:
+        return None
+    return nets or None  # an empty list means an unknown unit, or one without the filter
+
+
+def sync(unit: str) -> bool:
+    """Add to the unit's IPAddressDeny each of this machine's prefixes it lacks.
+
+    True if every prefix is denied. The change applies to the running service at once;
+    it lasts until the next boot (a runtime drop-in), when the watcher checks again.
+    """
+    fib_trie = _read("/proc/net/fib_trie")
+    if not fib_trie:
+        print("cannot read /proc/net/fib_trie", flush=True)
+        return False
+    applied = applied_deny(unit)
+    if applied is None:
+        print(f"cannot read the IPAddressDeny of {unit}", flush=True)
+        return False
+    missing = [net for net in own_prefixes(fib_trie, _read("/proc/net/if_inet6")) if not _covered(net, applied)]
+    if not missing:
+        return True
+    listed = " ".join(_fmt(net) for net in missing)
+    print(f"this machine has new addresses; denying {listed} to {unit}", flush=True)
+    done = _systemctl("set-property", "--runtime", unit, f"IPAddressDeny={listed}")
+    applied = applied_deny(unit)
+    if done.returncode or applied is None or not all(_covered(net, applied) for net in missing):
+        print(f"could not deny {listed} to {unit}: {done.stderr.strip()}", flush=True)
+        return False
+    return True
+
+
+def _notify(state: str) -> None:
+    """Report to systemd, for a Type=notify unit."""
+    path = os.environ.get("NOTIFY_SOCKET", "")
+    if not path:
+        return
+    if path.startswith("@"):
+        path = "\0" + path[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.connect(path)
+        sock.sendall(state.encode())
+
+
+def _next_event(events: socket.socket) -> bool:
+    try:
+        return bool(events.recv(65536))
+    except OSError as exc:  # ENOBUFS: the kernel dropped events; look at the addresses anyway
+        if exc.errno == errno.ENOBUFS:
+            return True
+        raise
+
+
+def watch(unit: str, events: socket.socket | None = None) -> int:
+    if events is None:
+        events = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+        events.bind((0, RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR | RTMGRP_IPV4_ROUTE))
+    # Subscribed before the first check, so a change made during it is not missed.
+    with events:
+        if not sync(unit):
+            return 1
+        _notify("READY=1")
+        while _next_event(events):
+            # Changes come in bursts: let them settle, then look once, but never
+            # later than SETTLE_MAX_S after the first event, however long it lasts.
+            deadline = time.monotonic() + SETTLE_MAX_S
+            while (left := deadline - time.monotonic()) > 0 and select.select([events], [], [], min(SETTLE_S, left))[0]:
+                if not _next_event(events):
+                    break
+            if not sync(unit):
+                return 1
+    print("the address events stopped", flush=True)
+    return 1
+
+
 def main(argv: list[str]) -> int:
     if argv[:1] == ["filter-config"] and len(argv) == 1:
         uplink = _read(RESOLVED_UPLINK) if os.path.exists(RESOLVED_UPLINK) else None
@@ -263,6 +362,8 @@ def main(argv: list[str]) -> int:
         return 0
     if argv[:1] == ["probe"] and len(argv) == 2:
         return probe(argv[1])
+    if argv[:1] == ["watch"] and len(argv) == 2:
+        return watch(argv[1])
     print(__doc__, file=sys.stderr)
     return 64
 
