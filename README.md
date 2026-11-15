@@ -166,7 +166,8 @@ scripts/test-remote.sh     # roda a suíte de testes na máquina remota (que tem
 SCRAPE_SSH="ssh user@outra-maquina" scripts/deploy.sh   # outra máquina
 ```
 
-O serviço continua na release anterior até o `install.sh` da nova terminar bem.
+A release nova só entra em serviço se o `install.sh` dela passar. Se falhar, ele
+volta para a anterior quando ela passa nas mesmas checagens, ou remove as units.
 O deploy guarda a release atual e a anterior e apaga as mais antigas.
 
 Os testes de integração sobem a API de verdade, com um site de teste e um proxy
@@ -187,8 +188,9 @@ proteções são em camadas:
     metadados e os próprios endereços da máquina (inclusive os públicos, como o
     IPv6 da VPS).
   - Toda conexão que o serviço ou o Chromium abrem para esses destinos é
-    recusada, venha de redirect, iframe, popup, worker, websocket ou DNS
-    rebinding. As conexões que chegam pela porta passada não são afetadas.
+    descartada pelo kernel (ela expira), venha de redirect, iframe, popup,
+    worker, websocket ou DNS rebinding. As conexões que chegam pela porta
+    passada não são afetadas.
 - **Na aplicação.** URLs ambíguas são recusadas: `\`, espaços, credenciais,
   porta ou host inválidos. O navegador recebe a URL canônica que foi conferida.
   Hosts privados são recusados no primeiro salto. Requisições do navegador para
