@@ -1,0 +1,38 @@
+[project]
+name = "scrape-api"
+version = "0.1.0"
+description = "Self-hosted, Firecrawl-compatible scraping API and MCP server on top of Crawl4AI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "crawl4ai>=0.9.5,<0.10",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "lxml>=5",
+    "mcp>=2.3,<3",
+    "pydantic>=2.7",
+    "regex>=2024.4",
+]
+
+[project.scripts]
+scrape-api = "scrape_api.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "firecrawl-py>=4.50",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scrape_api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "case(id): stable behavioural test-case ID (required on integration tests)",
+]
