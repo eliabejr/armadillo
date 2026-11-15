@@ -191,10 +191,6 @@ WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --quiet scrape-api.socket scrape-api.service
-# Free the port from an older unit, then bind it through the socket unit.
-if [[ -n "$OLD_PORT_HOLDER" ]]; then sudo systemctl stop scrape-api.service; fi
-sudo systemctl restart scrape-api.socket
-sudo systemctl restart scrape-api.service
 
 healthy() {
   for _ in $(seq 1 90); do
@@ -230,17 +226,18 @@ remove_units() {
 }
 # Put the previous units back if they still pass both checks. Otherwise, and on a
 # first install, remove the units: a later run must not restore a unit that never
-# proved its filter.
+# proved its filter. errexit still applies in here, so the steps that may fail
+# only feed the checks.
 rollback() {
-  sudo journalctl -u scrape-api -n 40 --no-pager >&2
+  sudo journalctl -u scrape-api -n 40 --no-pager >&2 || true
   sudo systemctl stop scrape-api.service scrape-api.socket || true
   if ls "$BACKUP"/* >/dev/null 2>&1; then
     echo "rolling back to the previous units" >&2
     sudo rm -f "$SOCKET_FILE"
     sudo cp "$BACKUP"/* /etc/systemd/system/
     sudo systemctl daemon-reload
-    if sudo test -f "$SOCKET_FILE"; then sudo systemctl start scrape-api.socket; fi
-    sudo systemctl start scrape-api.service
+    if sudo test -f "$SOCKET_FILE"; then sudo systemctl start scrape-api.socket || true; fi
+    sudo systemctl start scrape-api.service || true
     if healthy && filter_active; then die "$1; the previous release is back in service"; fi
     echo "the previous units fail the checks too; removing them" >&2
     sudo systemctl stop scrape-api.service scrape-api.socket || true
@@ -250,6 +247,11 @@ rollback() {
   remove_units
   die "$1"
 }
+# Free the port from an older unit, then bind it through the socket unit.
+if [[ -n "$OLD_PORT_HOLDER" ]]; then sudo systemctl stop scrape-api.service; fi
+{ sudo systemctl restart scrape-api.socket && sudo systemctl restart scrape-api.service; } ||
+  rollback "the new units did not start"
+
 step "Health check"
 healthy || rollback "the new release did not become healthy on port $PORT"
 curl -fsS "http://127.0.0.1:$PORT/health"; echo
