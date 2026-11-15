@@ -1,6 +1,6 @@
 # armadillo
 
-[English](README.md) · **Português**
+[English](README.md) · **Português** · [Español](README.es.md)
 
 API de scraping self-hosted, com a mesma API do Firecrawl, e servidor MCP para
 agentes Claude. Roda sobre o [Crawl4AI](https://github.com/unclecode/crawl4ai)
