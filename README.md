@@ -122,7 +122,7 @@ instalador instala sozinho as bibliotecas de sistema do Chromium; em outras
 distribuições, instale-as pelo gerenciador de pacotes se ele pedir.
 
 ```bash
-git clone <este repo> ~/apps/scrape-api   # ou copie a pasta
+git clone https://github.com/eliabejr/armadillo.git ~/apps/scrape-api
 cd ~/apps/scrape-api && ./deploy/install.sh
 ```
 
@@ -156,7 +156,7 @@ pública, que vira a base dos links dos crawls:
 ./deploy/install.sh --public-url https://api.example.com
 ```
 
-## A partir do Mac (este repo)
+## A partir da sua máquina (este repo)
 
 O destino fica em `.deploy.env` (fora do Git), por exemplo
 `SCRAPE_SSH="ssh -p 2222 usuario@host"`, ou na variável `SCRAPE_SSH`.
