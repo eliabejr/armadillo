@@ -37,7 +37,7 @@ accounts or billing.
 | AC-05 | `POST /v2/crawl` returns `{success:true, id, url}`. `GET /v2/crawl/{id}` returns `status`, `total`, `completed`, `data` and a `next` link while more results remain. `DELETE` cancels, or answers 409 once the crawl has finished. The crawl obeys `limit`, `maxDiscoveryDepth`, `includePaths`/`excludePaths` (regex on the path), child paths unless `crawlEntireDomain`, and robots.txt. The official firecrawl-py `crawl()` finishes against it. | Firecrawl v2 crawl; firecrawl-py 4.57. |
 | AC-06 | `/v1/scrape`, `/v1/map` (links as strings) and `/v1/crawl` accept the v1 shapes. | Firecrawl v1, for older integrations. |
 | AC-07 | `/mcp` is a streamable-HTTP MCP server behind the same auth, with the tools `scrape`, `screenshot`, `map`, `crawl_start` and `crawl_status`. An MCP client over HTTP lists the tools and calls them. | Claude agents on any machine (`claude mcp add --transport http`). |
-| AC-08 | Unless `SCRAPE_ALLOW_PRIVATE_URLS=true`, the service never returns content from a loopback, private, link-local or otherwise non-global address. It rejects (400) URLs that are not http(s), that are ambiguous (backslash, whitespace, credentials, bad port), or whose host resolves to such an address. The browser gets the canonical URL that was checked. Browser requests to private IP literals or localhost are aborted, and a page whose final URL is private is dropped with 400. Under the installed systemd unit, any connection the service or its browser opens to loopback, private networks or the machine's own addresses (public ones included) is dropped by the kernel. Only DNS resolvers on a private network are allowed; loopback and link-local resolvers never are. The installer proves the filter from inside the service's cgroup and never leaves a unit running that failed that proof. Socket activation keeps inbound connections working. The browser runs sandboxed as a dynamic user that cannot read the login user's home, other users' processes or Docker. | Public service on a VM with internal services; the pages scraped are untrusted. |
+| AC-08 | Unless `SCRAPE_ALLOW_PRIVATE_URLS=true`, the service never returns content from a loopback, private, link-local or otherwise non-global address. It rejects (400) URLs that are not http(s), that are ambiguous (backslash, whitespace, credentials, bad port), or whose host resolves to such an address. The browser gets the canonical URL that was checked. Browser requests to private IP literals or localhost are aborted, and a page whose final URL is private is dropped with 400. Under the installed systemd unit, any connection the service or its browser opens to loopback, private networks or the machine's own addresses (public ones included) is dropped by the kernel. Only DNS resolvers on a private network are allowed; loopback and link-local resolvers never are. The machine's own prefixes are denied (its IPv4 addresses and AnyIP ranges, the /64 around each IPv6 address), and a watcher adds new ones to the running service as addresses change; the service is bound to the watcher. The installer proves the filter from inside the service's cgroup and never leaves a unit running that failed that proof. Socket activation keeps inbound connections working. The browser runs sandboxed as a dynamic user that cannot read the login user's home, other users' processes or Docker. | Public service on a VM with internal services; the pages scraped are untrusted. |
 | AC-09 | `deploy/install.sh` runs repeatedly on a Debian host. It installs the env, the Playwright Chromium and a systemd unit, generates an API key once and keeps it on reruns, waits for `/health`, and records the public URL given with `--public-url`. It depends on no hosting provider; on non-Debian distributions it asks for Chromium's system libraries instead of installing them. | Owner: "reinstall on other machines"; 2026-11-15: an installer agnostic to the provider. |
 | AC-10 | The service runs on the current sandbox and answers from the Mac through the public HTTPS URL with the key. | Owner: endpoints reachable from any machine. |
 
@@ -96,9 +96,13 @@ accounts or billing.
 Three fresh reviewers: behaviour (spec, bugs), structure (standards,
 quality) and a security specialist (auth, SSRF, secrets, exposure), because the
 service is public. Fixes are re-reviewed by fresh reviewers. At most three
-remediation rounds without asking; the owner authorized a 4th on 2026-11-14.
+remediation rounds without asking; the owner authorized a 4th on 2026-11-14 and
+a 5th on 2026-11-15.
 
 ## Review log
+
+Commit hashes below are from the history before publication, which was squashed
+into one commit on 2026-11-15.
 
 - **Round 1** (review of `985028d`, fixed in `2014e0a`). Fixed:
   - malformed links;
@@ -202,32 +206,56 @@ remediation rounds without asking; the owner authorized a 4th on 2026-11-14.
   - items 1, 2, 4 and 5 of "Open after round 3" are closed;
   - item 3 is closed for every path that reaches `rollback()`.
 
-## Open after round 4 (needs a decision for a 5th round)
+## Round 5 (authorized by the user on 2026-11-15)
 
-- **Medium (other hosts).** Some failures leave enabled units that never passed the probe: a `systemctl restart`/`start` that fails under `set -e`, or an interrupt (SIGINT/SIGHUP) during the health wait. These exit before `rollback()`.
-  - Fix: an EXIT trap; `enable` only after the probe passes; rollback steps made non-fatal.
-- **Medium (other hosts).** The machine's own addresses are denied one exact address at a time, which misses:
-  - local prefix routes (AnyIP);
-  - rotating IPv6 temporary addresses;
-  - on-link IPv6 neighbours with global addresses (home LAN, AWS dual-stack subnets).
+- **Found on the VPS.** The VM keeps running across suspend (one boot since 2026-11-13; the service never restarted), and on resume it got a new public IPv6 in another /64 (`…:7b37:…::ba`, then `…:7b1d:…::d6`, each a single `/128`). Until the installer ran again, the new address was not denied, so the browser could reach the host's services listening on all addresses through it. Neither a /64 deny nor a check at service start would have caught this change.
+- **systemd 257, checked on the VPS:**
+  - `systemctl set-property --runtime` changes the running service's kernel filter at once: an address on `lo` went from reachable to dropped with no restart (negative control first);
+  - `daemon-reload` does not reinstall the filter of a running service;
+  - the runtime drop-in repeats the whole list after an empty `IPAddressDeny=`, so a stale one would hide a newer unit's list.
+- **Fixed:**
+  - The deny list holds the machine's prefixes: the IPv4 ranges routed to the machine (`host LOCAL`, so AnyIP ranges too) and the /64 around each IPv6 address (its on-link prefix, if shorter). Resolvers inside them are refused.
+  - `scrape-api-addresses.service` runs `netcheck.py watch`:
+    - it subscribes to netlink address events and IPv4 route events (AnyIP), checks once, reports ready (Type=notify, ordered before the service), then checks after each burst of changes, at most 0.5 s after its first event;
+    - it adds missing prefixes with `set-property --runtime` and reads the list back to prove it; if it cannot, it exits, and the service stops with it (`BindsTo=`);
+    - it runs as root from a root-owned copy (`/usr/local/lib/scrape-api/netcheck.py`) with `/usr/bin/python3`, sandboxed (`ProtectSystem=strict`, `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `IPAddressDeny=any`).
+  - The installer:
+    - stops the units and removes the runtime drop-in before reloading;
+    - restarts the units under `rollback` and checks that the watcher is active;
+    - backs up the watcher code with the units, and restores both on rollback;
+    - accepts restored units only if the watcher runs too (`healthy && filter_active && watcher_active`); the rollback steps that may fail only feed those checks.
+  - An unreadable `/proc/net/fib_trie` now warns (`filter-config`) or fails the watcher.
+  - README: the rollback sentence, and "dropped" instead of "refused".
+  - New tests NET-11..NET-17; the fixtures use documentation addresses.
+- **Review** by one fresh reviewer (security and correctness): no High.
+  - Medium: a rollback could restore units without the watcher.
+  - Low: a stream of events could delay the check without bound; AnyIP routes added later sent no address event; errexit inside `rollback`, and the watcher code was not restored; the old watcher could write a drop-in between its removal and the reload.
+  - Gaps: no test for a failed check after ready, or for ENOBUFS; the README understated prefixes shorter than /64.
+  - All fixed in this round and verified below. The fixes were not re-reviewed.
+- **Verified on the VPS:**
+  - 138 tests pass; 8 mutations of the new code were each caught (one by a hang, not an assertion);
+  - the deploy probe reported every target blocked, and the base list holds the VM's /64;
+  - an address added to `lo` while the service ran was denied by the watcher within a second, the probe showed it dropped, and the service was not restarted;
+  - an AnyIP route (`ip route add local 198.51.100.0/24 dev lo`) was denied within a second;
+  - stopping the watcher, or killing it with SIGKILL, stopped the service; the watcher came back after `RestartSec`, and the next request started the service;
+  - a release whose probe was forced to fail rolled back: the previous units and watcher code were restored, all three units ran, and no runtime drop-in was left.
 
-  This VPS has a single `/128` and no local prefix routes, but its address changes (next item).
-  - Fix: deny local-route prefixes and on-link IPv6 prefixes.
-- **Medium (this host).** The list of own addresses is fixed at install time, but this VM's public IPv6 changed while it was suspended (`…::ba` on 2026-11-14, `…::d6` at the 2026-11-15 deploy). Until the installer ran again, the new address was not denied, so the browser could reach the host's services listening on all addresses through it. The 2026-11-15 run denies `…::d6`; the next change will open the gap again.
-  - Fix: deny the address's whole prefix instead of the `/128`, and check the addresses again whenever the service starts.
+## Open after round 5
+
+- **Medium (other hosts).** An interrupt (SIGINT/SIGHUP) during the health wait, or a failing command outside the guarded restarts, exits before `rollback()` and leaves enabled units that never passed the probe.
+  - Fix: an EXIT trap; `enable` only after the probe passes.
 - **Low.**
+  - Between an address change and the watcher's update there is a short window (under a second on the VPS) when the new address is reachable.
+  - What the watcher adds lasts until reboot or the next install, so addresses the machine gave up stay denied.
   - The probe's listener never accepts: with roughly 60 or more own addresses, the backlog fills up and later connections count as "dropped".
   - A rollback after `--port N` health-checks the new port and removes working previous units.
-  - An unreadable `/proc/net/fib_trie` yields no own addresses and no warning.
   - Up to about 90 s of serving before the probe on a host without the filter.
 - **Low (tests).**
   - The race test passes if the reader thread crashes.
   - The deadline test pins `urls == []`.
-  - Nothing tests the `key=value` output that `install.sh` parses.
+  - Nothing tests the `key=value` output that `install.sh` parses, or the watcher's unit wiring, except the VPS run.
+  - A watcher that ignores a failed check after ready is caught only by a hang in NET-15.
   - The probe tests patch out the machine's own addresses and do not assert anything about `::1`.
-- **Docs.**
-  - README: "continua na release anterior" no longer holds when the previous units fail the probe.
-  - The kernel drops connections rather than refusing them.
 - **Optional.**
   - Deny NAT64 `64:ff9b::/96` and Azure's `168.63.129.16`.
   - Limit allowed private resolvers to port 53 (nftables). Today this is accepted and documented.
