@@ -19,10 +19,15 @@ from .mcp_server import build_mcp, mcp_http_app
 from .models import CrawlBody, InvalidRequest, MapBody, ScrapeBody
 from .service import Services, scrape_params, with_scheme
 from .urlguard import URLNotAllowed
+from .offeragents import fetch_feed
+from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
 
 PUBLIC_PATHS = frozenset({"/health"})
+
+class FeedBody(BaseModel):
+    url: str
 
 
 class BearerAuth:
@@ -123,6 +128,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    @app.post("/v2/offeragents-feed")
+    async def offeragents_feed(body: FeedBody):
+        try:
+            return {"success": True, "data": await fetch_feed(body.url)}
+        except ValueError:
+            return _error(400, "Invalid feed or response")
+        except Exception:
+            return _error(502, "Feed transport failed")
 
     @app.post("/v2/scrape")
     @app.post("/v1/scrape")

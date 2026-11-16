@@ -69,6 +69,7 @@ curl -s <URL>/v2/scrape \
 | `DELETE /v2/crawl/{id}` | Cancels. Returns 409 if the crawl has already finished. |
 | `/v1/scrape`, `/v1/map`, `/v1/crawl…` | The v1 shape (`map` returns the URLs as strings; accepts `maxDepth` and `ignoreSitemap`). |
 | `/mcp` | MCP server. |
+| `POST /v2/offeragents-feed` | Authenticated, bounded static HTML transport for the fixed Amazon and Mercado Livre feed URLs used by OfferAgents. Does not execute scripts, follow redirects, or use proxies. The caller must check robots.txt and validate redirects and response content. |
 
 Out of scope: `/search`, LLM extraction (`json`, `summary`), batch scrape,
 webhooks and page actions.
