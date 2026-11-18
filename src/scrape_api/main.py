@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import httpx
 from contextlib import asynccontextmanager
 from importlib.metadata import version
 
@@ -137,6 +138,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return _error(400, "Invalid feed or response")
         except Exception:
             return _error(502, "Feed transport failed")
+
+    @app.post("/v2/offeragents-session-feed")
+    async def offeragents_session_feed():
+        try:
+            transport = httpx.AsyncHTTPTransport(uds="/run/offeragents-ml/feed.sock")
+            async with httpx.AsyncClient(transport=transport, timeout=60, trust_env=False) as client:
+                response = await client.post("http://localhost/feed", headers={"Authorization": f"Bearer {settings.api_keys[0]}"})
+            if response.status_code == 409:
+                return _error(409, "Session verification required")
+            if response.status_code != 200 or len(response.content) > 128_000:
+                return _error(503, "Session feed unavailable")
+            data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get('items'), list) or len(data['items']) > 80:
+                return _error(502, "Invalid session feed")
+            return {"success": True, "data": data}
+        except Exception:
+            return _error(503, "Session feed unavailable")
 
     @app.post("/v2/scrape")
     @app.post("/v1/scrape")
